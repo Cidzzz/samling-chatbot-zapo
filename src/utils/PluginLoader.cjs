@@ -1,0 +1,223 @@
+const path     = require('path');
+const fs       = require('fs');
+const chokidar = require('chokidar');
+const chalk    = require('../../telegram/utils/chalkShim.cjs'); 
+const readline = require('readline');
+
+/**
+ * PluginLoader — support DUA format export:
+ *
+ * Format LAMA (object of functions):
+ * module.exports = { ping: async (m) => {...}, menu: async (m) => {...} }
+ *
+ * Format BARU (switch case):
+ * module.exports = async (m) => {
+ *   switch (m.command.name) {
+ *     case 'ping': ...; break;
+ *     case 'menu': ...; break;
+ *   }
+ * }
+ */
+
+const SRC_ROOT  = path.join(__dirname, '..');
+const PROJ_ROOT = path.join(__dirname, '..', '..');
+const LIB_ROOT  = path.join(PROJ_ROOT, 'lib');
+
+function purgeCache(filePath) {
+    let resolved;
+    try { resolved = require.resolve(filePath); } catch { return; }
+
+    const mod = require.cache[resolved];
+    if (!mod) return;
+
+    delete require.cache[resolved];
+
+    for (const child of mod.children || []) {
+        if ((child.id.startsWith(SRC_ROOT) || child.id.startsWith(LIB_ROOT)) && require.cache[child.id]) {
+            purgeCache(child.id);
+        }
+    }
+}
+
+class PluginLoader {
+    constructor() {
+        this.plugins = {};
+        this.files   = {};
+        this.folders = [
+            path.join(SRC_ROOT, 'cmd_samling'),
+            path.join(SRC_ROOT, 'cmd_samling', 'daftar_wilayah'),
+            path.join(SRC_ROOT, 'cmd_samling', 'daftar_wilayah', 'kecamatan'),
+            path.join(SRC_ROOT, 'cmd_samling', 'daftar_wilayah', 'tps'),
+            path.join(SRC_ROOT, 'cmd_samling', 'daftar_wilayah', 'tpa'),
+            path.join(SRC_ROOT, 'cmd_samling', 'daftar_wilayah', 'wilayah'),
+            path.join(SRC_ROOT, 'cmd_samling', 'lapor')
+        ];
+    }
+
+    _scanFiles() {
+        const files = [];
+        for (const folder of this.folders) {
+            if (fs.existsSync(folder)) {
+                const folderFiles = fs.readdirSync(folder)
+                    .filter(f => f.endsWith('.js') || f.endsWith('.cjs'))
+                    .map(f => path.join(folder, f));
+                files.push(...folderFiles);
+            }
+        }
+        return files;
+    }
+
+    _loadFile(filePath) {
+        purgeCache(filePath);
+
+        if (this.files[filePath]) {
+            this.files[filePath].forEach(cmd => delete this.plugins[cmd]);
+            delete this.files[filePath];
+        }
+
+        try {
+            const mod = require(filePath);
+            if (!mod) return;
+
+            const fileContent = fs.readFileSync(filePath, 'utf8');
+            const caseRegex = /case\s+['"]([^'"]+)['"]\s*:/g;
+            const autoCommands = [];
+            let match;
+
+            while ((match = caseRegex.exec(fileContent)) !== null) {
+                if (!autoCommands.includes(match[1])) autoCommands.push(match[1]);
+            }
+
+            const cmds = autoCommands.length > 0 ? autoCommands : (mod.commands || []);
+            const loaded = [];
+
+            if (typeof mod === 'function') {
+                for (const name of cmds) {
+                    this.plugins[name] = (m) => mod(m);
+                    loaded.push(name);
+                }
+            } else if (typeof mod === 'object') {
+                for (const [name, fn] of Object.entries(mod)) {
+                    if (typeof fn === 'function') {
+                        this.plugins[name] = fn;
+                        loaded.push(name);
+                    }
+                }
+            } else {
+                console.warn(chalk.yellow(`[WARN] Format tidak dikenal: ${path.basename(filePath)}`));
+                return;
+            }
+
+            this.files[filePath] = loaded;
+        } catch (err) {
+            console.error(
+                chalk.red(`[ERROR] Gagal memuat `) +
+                chalk.cyan(path.basename(filePath)) +
+                chalk.red(`: ${err.message}`)
+            );
+        }
+    }
+
+    _unloadFile(filePath) {
+        if (this.files[filePath]) {
+            const removed = this.files[filePath];
+            removed.forEach(cmd => delete this.plugins[cmd]);
+            delete this.files[filePath];
+            console.log(
+                chalk.gray(`[-] Unloaded `) +
+                chalk.cyan(path.basename(filePath)) +
+                chalk.gray(` -> [${removed.join(', ')}]`)
+            );
+        }
+    }
+
+    _reloadAllCommands(changedFile) {
+        readline.clearLine(process.stdout, 0);
+        readline.cursorTo(process.stdout, 0);
+
+        const rel = path.relative(PROJ_ROOT, changedFile);
+        console.log(
+            chalk.red(`\n[UPDATE]`) +
+            chalk.yellow(` Dependency berubah: `) +
+            chalk.cyan(rel) +
+            chalk.yellow(` → reload semua command...`)
+        );
+
+        for (const f of this._scanFiles()) this._loadFile(f);
+
+        console.log(chalk.blue(`[LOADER] ${Object.keys(this.plugins).length} command aktif`));
+    }
+
+    init() {
+        for (const f of this._scanFiles()) this._loadFile(f);
+        console.log(`[PluginLoader] Total loaded WA commands: ${Object.keys(this.plugins).length}`);
+        console.log(`[PluginLoader] Loaded WA commands list: ${Object.keys(this.plugins).join(', ')}`);
+        const watchTarget = [SRC_ROOT, LIB_ROOT];
+
+        //console.log(chalk.blue(`[WATCHER] Monitoring src/ dan lib/ (kecuali node_modules & database)`));
+        //console.log(chalk.blue(`[LOADER] Total command aktif: ${Object.keys(this.plugins).length} fitur`));
+
+        const watcher = chokidar.watch(watchTarget, {
+            persistent: true,
+            ignoreInitial: true,
+            ignored: [
+                /node_modules/,
+                /src[\\/]database/, 
+                /src[\\/]media/,
+                /\.json$/,
+            ],
+            awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
+        });
+
+        watcher
+            .on('change', (filePath) => {
+                if (!filePath.endsWith('.js')) return;
+                readline.clearLine(process.stdout, 0);
+                readline.cursorTo(process.stdout, 0);
+                const isCommand = this.folders.some(f => filePath.startsWith(f));
+                if (isCommand) {
+                    console.log(
+                        chalk.red(`\n[UPDATE]`) +
+                        chalk.yellow(` Command berubah: `) +
+                        chalk.cyan(path.basename(filePath))
+                    );
+                    this._loadFile(filePath);
+                } else {
+                    this._reloadAllCommands(filePath);
+                }
+            })
+            .on('add', (filePath) => {
+                if (!filePath.endsWith('.js')) return;
+                if (this.folders.some(f => filePath.startsWith(f))) {
+                    console.log(chalk.green(`\n[+] Command baru: `) + chalk.cyan(path.basename(filePath)));
+                    this._loadFile(filePath);
+                } else {
+                    this._reloadAllCommands(filePath);
+                }
+            })
+            .on('unlink', (filePath) => {
+                if (!filePath.endsWith('.js')) return;
+                if (this.folders.some(f => filePath.startsWith(f))) {
+                    this._unloadFile(filePath);
+                } else {
+                    this._reloadAllCommands(filePath);
+                }
+            });
+
+        return this;
+    }
+
+    get(commandName)  { return this.plugins[commandName] || null; }
+    has(commandName)  { return commandName in this.plugins; }
+    commandList()     { return Object.keys(this.plugins); }
+    commandsByFile()  {
+        const result = {};
+        for (const [filePath, cmds] of Object.entries(this.files)) {
+            const name = path.basename(filePath, '.js');
+            result[name] = cmds;
+        }
+        return result;
+    }
+}
+
+module.exports = new PluginLoader();
